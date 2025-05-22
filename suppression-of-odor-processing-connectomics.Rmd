@@ -1,0 +1,389 @@
+---
+title: "Selective life-long suppression of an odor processing channel in response to critical period experience"
+subtitle: "Connectomics"
+author: "Abigail Wilkov"
+date: "2025-05-21"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+# install necessary packages
+# remotes::install_github("natverse/fafbseg") 
+# remotes::install_github("natverse/nat.flybrains")
+```
+
+
+```{r, results = 'hide'}
+# read in packages
+library(fafbseg)
+library(gplots)
+library(viridis)
+library(reticulate)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(RColorBrewer)
+library(RSQLite)
+library(dbplyr)
+library(tibble)
+library(stringr)
+library(kableExtra)
+library(nat.flybrains)
+library(git2r)
+library(readobj)
+
+```
+
+
+```{r, results = 'hide'}
+# create simple python environment
+fafbseg::simple_python('full')
+
+# store token
+# options(fafbseg.token = )
+
+# set dataset 
+choose_segmentation("public-flywire31")
+
+```
+
+
+```{r}
+# get all neuron data
+all_neurons = flytable_meta()
+
+# find ids of areas of interest 
+vm7d <- all_neurons %>% filter(cell_type == "ORN_VM7d")
+vm2 <- all_neurons %>% filter(cell_type == "ORN_VM2")
+
+# save osn ids
+vm7d_osn <- vm7d %>% subset(select = root_id)
+# write.csv(vm7d_osn, "vm7d_osn.csv")
+
+vm2_osn <- vm2 %>% subset(select = root_id)
+# write.csv(vm2_osn, "vm2_osn.csv")
+
+# save pn ids
+vm7d_pn <- all_neurons %>% 
+  filter(cell_type == "VM7d_adPN") %>% 
+  subset(select = root_id)
+# write.csv(vm7d_pn, "vm7d_pn.csv")
+
+vm2_pn <- all_neurons %>% 
+  filter(cell_type == "VM2_adPN") %>% 
+  subset(select = root_id)
+# write.csv(vm2_pn, "vm2_pn.csv")
+
+
+```
+
+```{r, results = 'hide'}
+# find partners
+vm7d_connections <- flywire_partners(
+  vm7d,
+  partners = "both") %>%   
+  subset(select = c(pre_id, post_id, prepost))
+
+vm2_connections <- flywire_partners(
+  vm2,
+  partners = "both") %>%
+  subset(select = c(pre_id, post_id, prepost))
+
+# get cell type names 
+cell_types <- flytable_cell_types()
+
+```
+
+
+
+```{r}
+# function to calculate inputs
+input_calculations <- function(connections, cell_types) {
+
+  # filter for only inputs (prepost = 1)
+  inputs <- connections %>% filter(prepost == 1) %>% 
+    # make each row a unique observation and sum instances of synapses
+    pivot_wider(id_cols = "post_id", 
+              names_from = "pre_id", 
+              values_from = "prepost", 
+              values_fn = sum) %>% 
+    # replace NA with 0
+    mutate_all(.,  ~replace_na(.,0))
+  
+  # get total synapses across all ORNs for each input
+  inputs <- inputs %>% colSums() %>% as.data.frame()
+  
+  # filter for 5 synapses
+  inputs <- inputs %>% 
+    rownames_to_column() %>% 
+    rename("syn_count" = ".", "pre_id" = "rowname") %>% 
+    filter(syn_count > 5)
+  
+  # get rid of header
+  inputs <- inputs[- 1, ]
+  
+  # join cell type name with inputs using pre_id and root_id to match
+   input_types <- left_join(inputs, 
+                             cell_types, 
+                             join_by(pre_id == root_id))
+  
+  
+  input_types <- input_types %>% 
+    # remove unnecessary columns
+    subset(select = -c(supervoxel_id, side, flow, 
+                     top_nt, ito_lee_hemilineage, fbbt_id)) %>%
+    # convert cell type to factor 
+    mutate(cell_type = as.factor(cell_type)) %>%
+    # group by cell type
+    group_by(cell_type)  %>%
+    # combine all lLN2T and lLN2P subtypes,  relabel OSN and PN  
+    mutate(cell_type = str_replace(cell_type, ".*lLN2T.*", "lLN2T"), 
+         cell_type = str_replace(cell_type, ".*lLN2P.*", "lLN2P"),
+         cell_type = str_replace(cell_type, ".*ORN.*", "OSN"),
+         cell_type = str_replace(cell_type, ".*adPN.*", "PN")) %>% 
+    # sum synapses across types
+    summarize(sum_synapses = sum(syn_count))  %>% 
+    # calculate proportion of total synapses
+    mutate(syn_proportion = sum_synapses / sum(sum_synapses)) %>% 
+    # filter for greater than 5% of total synapses
+    filter(syn_proportion > 0.05) %>%
+    # remove NA cell type
+    drop_na()
+    
+  
+  return(input_types)
+  
+  
+}
+
+# function to calculate outputs
+output_calculations <- function(connections, cell_types) { 
+  
+  # filter for only outputs (prepost = 0)
+  outputs <- connections %>% filter(prepost == 0) %>% 
+    # make each row a unique observation and sum instances of synapses
+    pivot_wider(id_cols = "pre_id", 
+              names_from = "post_id", 
+              values_from = "prepost", 
+              values_fn =function(x) sum(!is.na(x))) %>%
+    # replace NA with 0
+    mutate_all(.,  ~replace_na(.,0))
+  
+  # get total synapses across all OSNs for each output
+  outputs <- outputs %>% colSums() %>% as.data.frame()
+  
+  # filter for 5 synapses
+  outputs <- outputs %>% 
+    rownames_to_column() %>% 
+    rename("syn_count" = ".", "post_id" = "rowname") %>% 
+    filter(syn_count > 5)
+ 
+  # get rid of header
+  outputs <- outputs[- 1, ]
+  
+  # join cell type name with inputs using post_id and root_id to match
+  output_types <- left_join(outputs, 
+                             cell_types, 
+                             join_by(post_id == root_id))
+
+  
+  output_types <- output_types %>% 
+    # remove unnecessary columns
+     subset(select = -c(supervoxel_id, side, flow, 
+                     top_nt, ito_lee_hemilineage, fbbt_id)) %>%
+    # convert cell type to factor 
+    mutate(cell_type = as.factor(cell_type)) %>%
+    # group by cell type
+    group_by(cell_type)  %>%
+    # combine all lLN2T and lLN2P subtypes, relabel OSN and PN 
+    mutate(cell_type = str_replace(cell_type, ".*lLN2T.*", "lLN2T"), 
+         cell_type = str_replace(cell_type, ".*lLN2P.*", "lLN2P"),       
+         cell_type = str_replace(cell_type, ".*ORN.*", "OSN"),
+         cell_type = str_replace(cell_type, ".*adPN.*", "PN")) %>% 
+    # sum synapses across types
+    summarize(sum_synapses = sum(syn_count))  %>% 
+    # calculate proportion of total synapses
+    mutate(syn_proportion = sum_synapses / sum(sum_synapses)) %>% 
+    # filter for greater than 5% of total synapses
+    filter(syn_proportion > 0.05) %>%
+    # remove NA cell type
+    drop_na()
+   
+  
+  return(output_types)
+  
+}
+
+
+```
+
+
+```{r}
+
+# run input and output functions
+vm7d_inputs <- input_calculations(vm7d_connections, cell_types)
+vm7d_outputs <- output_calculations(vm7d_connections, cell_types)
+
+vm2_inputs <- input_calculations(vm2_connections, cell_types)
+vm2_outputs <- output_calculations(vm2_connections, cell_types)
+
+```
+
+
+```{r}
+# create pie charts
+# save figure as EPS
+# setEPS()
+# postscript("pie_charts.eps", width = 8, height = 8)
+
+# set up a 2x2 plot layout
+par(mfrow = c(2, 2))
+
+# adjust margins to fit titles
+par(mar = c(2, 2, 3, 1)) 
+
+sorted_pie <- function(values, labels, main_title) {
+  # color scheme with cell types as names
+  color_scheme = c("OSN" = "#278943",
+                   "PN" = "#ffcd05",
+                   "il3LN6" = "deepskyblue",
+                   "lLN2F_b" = "blue4",
+                   "lLN2P" = "cornflowerblue",
+                   "lLN2T" = "turquoise1",
+                   "lLN2F_a" = "dodgerblue4")
+
+  # create a data frame
+  df <- data.frame(values = values, labels = labels)
+
+  # sort  cell types in descending order
+  df <- df[order(df$values, decreasing = TRUE), ]
+
+  # match colors to labels that exist in the data
+  slice_colors <- sapply(df$labels, function(lbl) {
+    if(lbl %in% names(color_scheme)) {
+      return(color_scheme[lbl])
+    } else {
+      return("gray") # default color for any unmatched labels
+    }
+  })
+
+  # plot the sorted pie chart with matched colors
+  pie(df$values,
+      labels = df$labels,  # use sorted labels from df
+      main = main_title,
+      col = slice_colors)  # use matched colors
+
+}
+
+
+# VM7d inputs
+sorted_pie(vm7d_inputs$sum_synapses,
+            vm7d_inputs$cell_type,
+            "Synaptic Inputs to VM7")
+
+# VM7d outputs
+sorted_pie(vm7d_outputs$sum_synapses,
+            vm7d_outputs$cell_type,
+            "Synaptic Outputs from VM7")
+
+# VM2 inputs
+sorted_pie(vm2_inputs$sum_synapses,
+            vm2_inputs$cell_type,
+            "Synaptic Inputs to VM2")
+
+# VM2 outputs
+sorted_pie(vm2_outputs$sum_synapses,
+            vm2_outputs$cell_type,
+            "Synaptic Outputs from VM2")
+
+# close EPS device to save file
+# dev.off()
+
+par(mfrow = c(1, 1))
+
+```
+
+```{r}
+
+# extract LN neuron IDs for skeletons
+vm7d_inputs <- vm7d_connections %>% filter(prepost == 1) %>% 
+    # make each row a unique observation and sum instances of synapses
+    pivot_wider(id_cols = "post_id", 
+              names_from = "pre_id", 
+              values_from = "prepost", 
+              values_fn = sum) %>% 
+    # replace NA with 0
+    mutate_all(.,  ~replace_na(.,0))
+  
+# get total synapses across all ORNs for each input
+ vm7d_inputs <- vm7d_inputs %>% colSums() %>% as.data.frame()
+  
+# filter for 5 synapses
+ vm7d_inputs <- vm7d_inputs %>% 
+    rownames_to_column() %>% 
+    rename("syn_count" = ".", "pre_id" = "rowname") %>% 
+    filter(syn_count > 5)
+  
+# get rid of header
+vm7d_inputs <- vm7d_inputs[- 1, ]
+  
+# join cell type name with inputs using pre_id and root_id to match
+vm7d_input_types <- left_join(vm7d_inputs, 
+                             cell_types, 
+                             join_by(pre_id == root_id))
+  
+# lLN2F_b
+vm7d_input_lLN2F_b <- vm7d_input_types %>% 
+    # remove unnecessary columns
+    subset(select = -c(supervoxel_id, side, flow, 
+                     top_nt, ito_lee_hemilineage, fbbt_id)) %>%
+    # convert cell type to factor 
+    mutate(cell_type = as.factor(cell_type)) %>%
+    # group by cell type
+    filter(cell_type == "lLN2F_b") %>% head(1)
+# write.csv(vm7d_input_lLN2F_b, "lLN2F_b.csv")
+  
+# il3LN6
+vm7d_input_il3LN6 <- vm7d_input_types %>% 
+    # remove unnecessary columns
+    subset(select = -c(supervoxel_id, side, flow, 
+                     top_nt, ito_lee_hemilineage, fbbt_id)) %>%
+    # convert cell type to factor 
+    mutate(cell_type = as.factor(cell_type)) %>%
+    # group by cell type
+    filter(cell_type == "il3LN6") %>% head(1)
+# write.csv(vm7d_input_il3LN6, "il3LN6.csv")
+  
+# lLN2P
+vm7d_input_lLN2P <- vm7d_input_types %>% 
+    # remove unnecessary columns
+    subset(select = -c(supervoxel_id, side, flow, 
+                     top_nt, ito_lee_hemilineage, fbbt_id)) %>%
+    # convert cell type to factor 
+    mutate(cell_type = as.factor(cell_type)) %>%
+    mutate(cell_type = str_replace(cell_type, ".*lLN2P.*", "lLN2P")) %>%
+    # group by cell type
+    filter(cell_type == "lLN2P") %>% head(1)
+# write.csv(vm7d_input_lLN2P,"lLN2P.csv")
+    
+# lLN2T 
+vm7d_input_lLN2T <- vm7d_input_types %>% 
+    # remove unnecessary columns
+    subset(select = -c(supervoxel_id, side, flow, 
+                     top_nt, ito_lee_hemilineage, fbbt_id)) %>%
+    # convert cell type to factor 
+    mutate(cell_type = as.factor(cell_type)) %>%     
+    mutate(cell_type = str_replace(cell_type, ".*lLN2T.*", "lLN2T") )%>%
+    # group by cell type 
+    filter(cell_type == "lLN2T") %>% head(1)
+# write.csv(vm7d_input_lLN2T, "lLN2T.csv")
+
+```
+
+
+
