@@ -14,7 +14,6 @@ knitr::opts_chunk$set(echo = TRUE)
 ```{r}
 # install necessary packages
 # remotes::install_github("natverse/fafbseg") 
-# remotes::install_github("natverse/nat.flybrains")
 ```
 
 
@@ -33,7 +32,6 @@ library(dbplyr)
 library(tibble)
 library(stringr)
 library(kableExtra)
-library(nat.flybrains)
 library(git2r)
 library(readobj)
 
@@ -86,12 +84,14 @@ vm2_pn <- all_neurons %>%
 # find partners
 vm7d_connections <- flywire_partners(
   vm7d,
-  partners = "both") %>%   
+  partners = "both", 
+  threshold = 5) %>%
   subset(select = c(pre_id, post_id, prepost))
 
 vm2_connections <- flywire_partners(
   vm2,
-  partners = "both") %>%
+  partners = "both", 
+  threshold = 5) %>%
   subset(select = c(pre_id, post_id, prepost))
 
 # get cell type names 
@@ -118,11 +118,10 @@ input_calculations <- function(connections, cell_types) {
   # get total synapses across all ORNs for each input
   inputs <- inputs %>% colSums() %>% as.data.frame()
   
-  # filter for 5 synapses
+  # rename columns
   inputs <- inputs %>% 
     rownames_to_column() %>% 
-    rename("syn_count" = ".", "pre_id" = "rowname") %>% 
-    filter(syn_count > 5)
+    rename("syn_count" = ".", "pre_id" = "rowname")
   
   # get rid of header
   inputs <- inputs[- 1, ]
@@ -148,20 +147,23 @@ input_calculations <- function(connections, cell_types) {
          cell_type = str_replace(cell_type, ".*adPN.*", "PN")) %>% 
     # sum synapses across types
     summarize(sum_synapses = sum(syn_count))  %>% 
+    # drop NA cell type
+    drop_na() %>% 
     # calculate proportion of total synapses
     mutate(syn_proportion = sum_synapses / sum(sum_synapses)) %>% 
-    # filter for greater than 5% of total synapses
-    filter(syn_proportion > 0.05) %>%
-    # remove NA cell type
-    drop_na()
-    
+    # sort sum_synapses in descending order
+    arrange(desc(sum_synapses)) %>%
+    # add cumulative proportion column
+    mutate(cumulative_prop = cumsum(sum_synapses) / sum(sum_synapses)) %>%
+    # keep rows where cumulative proportion is less than or equal to 95%
+    filter(cumulative_prop <= 0.95)
   
   return(input_types)
   
   
 }
 
-# function to calculate outputs
+
 output_calculations <- function(connections, cell_types) { 
   
   # filter for only outputs (prepost = 0)
@@ -177,11 +179,10 @@ output_calculations <- function(connections, cell_types) {
   # get total synapses across all OSNs for each output
   outputs <- outputs %>% colSums() %>% as.data.frame()
   
-  # filter for 5 synapses
+  # rename columns
   outputs <- outputs %>% 
     rownames_to_column() %>% 
-    rename("syn_count" = ".", "post_id" = "rowname") %>% 
-    filter(syn_count > 5)
+    rename("syn_count" = ".", "post_id" = "rowname")
  
   # get rid of header
   outputs <- outputs[- 1, ]
@@ -207,13 +208,17 @@ output_calculations <- function(connections, cell_types) {
          cell_type = str_replace(cell_type, ".*adPN.*", "PN")) %>% 
     # sum synapses across types
     summarize(sum_synapses = sum(syn_count))  %>% 
-    # calculate proportion of total synapses
-    mutate(syn_proportion = sum_synapses / sum(sum_synapses)) %>% 
-    # filter for greater than 5% of total synapses
-    filter(syn_proportion > 0.05) %>%
     # remove NA cell type
-    drop_na()
-   
+    drop_na() %>%
+    # calculate proportion of total synapses
+    mutate(syn_proportion = sum_synapses / sum(sum_synapses)) %>%
+    # sort sum_synapses in descending order
+    arrange(desc(sum_synapses)) %>%
+    # add cumulative proportion column
+    mutate(cumulative_prop = cumsum(sum_synapses) / sum(sum_synapses)) %>%
+    # keep rows where cumulative proportion is less than or equal to 95%
+    filter(cumulative_prop <= 0.95)
+
   
   return(output_types)
   
@@ -255,29 +260,43 @@ sorted_pie <- function(values, labels, main_title) {
                    "lLN2F_b" = "blue4",
                    "lLN2P" = "cornflowerblue",
                    "lLN2T" = "turquoise1",
-                   "lLN2F_a" = "dodgerblue4")
-
+                   "lLN2F_a" = "dodgerblue4",
+                   "Other" = "gray")  
+  
   # create a data frame
   df <- data.frame(values = values, labels = labels)
-
-  # sort  cell types in descending order
-  df <- df[order(df$values, decreasing = TRUE), ]
-
-  # match colors to labels that exist in the data
-  slice_colors <- sapply(df$labels, function(lbl) {
-    if(lbl %in% names(color_scheme)) {
-      return(color_scheme[lbl])
-    } else {
-      return("gray") # default color for any unmatched labels
-    }
+  
+  # identify which labels have specific colors vs those that should be "Other"
+  has_color <- df$labels %in% names(color_scheme)[names(color_scheme) != "Other"]
+  
+  # separate data into specific cell types and others
+  specific_df <- df[has_color, ]
+  other_df <- df[!has_color, ]
+  
+  # combine "other" categories into single row if any exist
+  if(nrow(other_df) > 0) {
+    other_total <- sum(other_df$values)
+    other_row <- data.frame(values = other_total, labels = "Other")
+    # combine specific types with "Other" category
+    df_combined <- rbind(specific_df, other_row)
+  } else {
+    # if no "other" categories, use original data
+    df_combined <- specific_df
+  }
+  
+  # sort cell types in descending order
+  df_combined <- df_combined[order(df_combined$values, decreasing = TRUE), ]
+  
+  # match colors to labels
+  slice_colors <- sapply(df_combined$labels, function(lbl) {
+    return(color_scheme[lbl])
   })
-
+  
   # plot the sorted pie chart with matched colors
-  pie(df$values,
-      labels = df$labels,  # use sorted labels from df
+  pie(df_combined$values,
+      labels = df_combined$labels,
       main = main_title,
-      col = slice_colors)  # use matched colors
-
+      col = slice_colors)
 }
 
 
@@ -305,6 +324,7 @@ sorted_pie(vm2_outputs$sum_synapses,
 # dev.off()
 
 par(mfrow = c(1, 1))
+
 
 ```
 
